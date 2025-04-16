@@ -6,7 +6,7 @@ import requests # To call Ollama API
 import datetime
 import time
 import re
-# Removed subprocess and shutil imports
+import random # Added for shuffling
 from collections import defaultdict
 from pathlib import Path
 import sys
@@ -14,55 +14,40 @@ import sys
 # --- Configuration ---
 DEFAULT_OLLAMA_API_URL = "http://localhost:11434/api/generate"
 DEFAULT_OLLAMA_MODEL = "mistral"
-PROFILE_SCHEMA_VERSION = "1.5" # Incremented version for LLM analysis-only role
+PROFILE_SCHEMA_VERSION = "1.6" # Incremented version for randomized processing
 PATCH_SEPARATOR = "-------------------- COMMIT MESSAGE ABOVE / PATCH BELOW --------------------"
-META_FILENAME = ".source_repo_info" # Keep for potential future use or debugging repo paths
+META_FILENAME = ".source_repo_info" # No longer read by script, but kept for info
 # --- Sanity Check Limits ---
 MAX_PATCH_SIZE_BYTES = 2 * 1024 * 1024
 MAX_PATCH_LINES = 100000
 
 
-# --- Helper Functions ---
+# --- Helper Functions (call_ollama, parse_patch_metadata_from_content, load_profile, atomic_save_profile, make_json_serializable, update_profile_based_on_analysis) ---
+# Note: These helper functions remain unchanged from the previous version (v8),
+#       they are included here for completeness of the script file.
 
 def call_ollama(prompt, model, ollama_url):
     """Sends prompt to Ollama and returns the parsed JSON response."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json"
-    }
-
+    payload = { "model": model, "prompt": prompt, "stream": False, "format": "json" }
+    # print(f"  Sending request to Ollama (Model: {model})...") # Less verbose
     try:
-        response = requests.post(ollama_url, json=payload, timeout=600) # 10 min timeout
+        response = requests.post(ollama_url, json=payload, timeout=600)
         response.raise_for_status()
         response_data = response.json()
+        # print("  Ollama response received.") # Less verbose
         if 'response' in response_data:
-            try:
-                llm_json_output = json.loads(response_data['response'])
-                return llm_json_output
+            try: return json.loads(response_data['response'])
             except (json.JSONDecodeError, TypeError) as e:
                  print(f"\n  Error: Problem decoding/processing Ollama response JSON: {e}")
                  print(f"  Raw response value: {response_data.get('response')}")
                  return None
-        else:
-            print(f"\n  Warning: Ollama response missing 'response' field. Full response: {response_data}")
-            return None
-    except requests.exceptions.Timeout:
-        print(f"\n  Error: Ollama API request timed out.")
-        return None
-    except requests.exceptions.RequestException as e:
-        print(f"\n  Error calling Ollama API at {ollama_url}: {e}")
-        return None
-    except Exception as e:
-        print(f"\n  An unexpected error occurred during Ollama call: {e}")
-        return None
+        else: print(f"\n  Warning: Ollama response missing 'response' field. Full response: {response_data}"); return None
+    except requests.exceptions.Timeout: print(f"\n  Error: Ollama API request timed out."); return None
+    except requests.exceptions.RequestException as e: print(f"\n  Error calling Ollama API at {ollama_url}: {e}"); return None
+    except Exception as e: print(f"\n  An unexpected error occurred during Ollama call: {e}"); return None
 
 def parse_patch_metadata_from_content(patch_content, commit_hash):
-    """
-    Extracts metadata directly from the patch file content, including timestamp.
-    Returns None for timestamp if parsing fails.
-    """
+    """Extracts metadata directly from the patch file content, including timestamp."""
     metadata = {
         "commit_hash": commit_hash, "timestamp": None,
         "lines_added": len(re.findall(r"^\+[^+]", patch_content, re.MULTILINE)),
@@ -73,7 +58,7 @@ def parse_patch_metadata_from_content(patch_content, commit_hash):
     if ts_match:
         try: metadata["timestamp"] = int(ts_match.group(1))
         except ValueError: print(f"  Warning: Could not parse timestamp number for {commit_hash}.")
-    # Store the full content for the LLM
+    # Store the full content for the LLM, don't pre-split here
     return metadata
 
 def load_profile(profile_path, person_identifier, author_subdirs):
@@ -119,131 +104,77 @@ def make_json_serializable(item):
     if item == float('inf') or item == float('-inf'): return None
     return item
 
+def make_llm_context_serializable(item, key_path=""):
+    """
+    Recursively converts sets to lists, handles infinity/None,
+    AND specifically skips the 'repos' key when nested under 'technology_experience'.
+    Used only for creating the LLM prompt context string.
+    """
+    if isinstance(item, set): return sorted(list(item))
+    if isinstance(item, dict):
+        new_dict = {}
+        for k, v in item.items():
+            current_key_path = f"{key_path}.{k}" if key_path else k
+            if key_path.startswith("technology_experience") and k == "repos": continue
+            new_dict[k] = make_llm_context_serializable(v, current_key_path)
+        return new_dict
+    if isinstance(item, list): return [make_llm_context_serializable(elem, key_path) for elem in item]
+    if item == float('inf') or item == float('-inf'): return None
+    return item
+
 def update_profile_based_on_analysis(profile_data, llm_analysis_result, patch_metadata, repo_name):
     """
     Applies updates to the profile data based on the ANALYSIS results
     received from the LLM (intent, technologies, notables).
     """
-    if not llm_analysis_result or not isinstance(llm_analysis_result, dict):
-        print("  Warning: LLM provided no valid analysis structure. Profile not changed.")
-        return profile_data
-
-    # Extract analysis results safely using .get()
-    intent = llm_analysis_result.get("intent", "other") # Default to 'other' if missing
-    technologies = llm_analysis_result.get("technologies", [])
-    notables = llm_analysis_result.get("notables", [])
-
-    # Validate extracted data types
-    if not isinstance(intent, str) or intent not in ['feature', 'fix', 'refactor', 'test', 'docs', 'chore', 'perf', 'other']:
-         print(f"  Warning: Invalid 'intent' ('{intent}') received from LLM. Defaulting to 'other'.")
-         intent = "other"
-    if not isinstance(technologies, list):
-         print(f"  Warning: Invalid 'technologies' format received from LLM (expected list). Skipping tech update.")
-         technologies = []
-    if not isinstance(notables, list):
-         print(f"  Warning: Invalid 'notables' format received from LLM (expected list). Skipping notables update.")
-         notables = []
-
-    commit_ts = patch_metadata.get("timestamp") # Use the timestamp parsed earlier
-    commit_hash = patch_metadata["commit_hash"]
-
-    if commit_ts is None:
-         print(f"  Critical Error: Timestamp is None during update for {commit_hash}. Cannot update time-based stats.")
-         return profile_data
-
-    # --- Apply Updates using the analysis results ---
+    # This function remains the same as v8
+    if not llm_analysis_result or not isinstance(llm_analysis_result, dict): print("  Warning: LLM provided no valid analysis structure. Profile not changed."); return profile_data
+    intent = llm_analysis_result.get("intent", "other"); technologies = llm_analysis_result.get("technologies", []); notables = llm_analysis_result.get("notables", [])
+    if not isinstance(intent, str) or intent not in ['feature', 'fix', 'refactor', 'test', 'docs', 'chore', 'perf', 'other']: print(f"  Warning: Invalid 'intent' ('{intent}') received from LLM. Defaulting to 'other'."); intent = "other"
+    if not isinstance(technologies, list): print(f"  Warning: Invalid 'technologies' format received from LLM (expected list). Skipping tech update."); technologies = []
+    if not isinstance(notables, list): print(f"  Warning: Invalid 'notables' format received from LLM (expected list). Skipping notables update."); notables = []
+    commit_ts = patch_metadata.get("timestamp"); commit_hash = patch_metadata["commit_hash"]
+    if commit_ts is None: print(f"  Critical Error: Timestamp is None during update for {commit_hash}. Cannot update time-based stats."); return profile_data
 
     # 1. Update Repositories Section
-    # Initialize repo entry if it doesn't exist
-    if repo_name not in profile_data["repositories"]:
-        profile_data["repositories"][repo_name] = {
-            "first_commit_ts": commit_ts, "last_commit_ts": commit_ts, "commit_count": 0,
-            "lines_added": 0, "lines_removed": 0, "languages": {}, "technologies": {},
-            "inferred_commit_types": defaultdict(int)
-        }
-    repo_entry = profile_data["repositories"][repo_name]
-    # Ensure sub-dictionaries/counters exist
-    repo_entry.setdefault("languages", {})
-    repo_entry.setdefault("technologies", {})
-    if not isinstance(repo_entry.get("inferred_commit_types"), defaultdict):
-         repo_entry["inferred_commit_types"] = defaultdict(int, repo_entry.get("inferred_commit_types", {}))
-
-    # Increment counts and update timestamps
-    repo_entry["commit_count"] += 1
-    repo_entry["last_commit_ts"] = max(repo_entry.get("last_commit_ts") or float('-inf'), commit_ts)
-    repo_entry["first_commit_ts"] = min(repo_entry.get("first_commit_ts") or float('inf'), commit_ts)
-    repo_entry["lines_added"] = repo_entry.get("lines_added", 0) + patch_metadata.get("lines_added", 0)
-    repo_entry["lines_removed"] = repo_entry.get("lines_removed", 0) + patch_metadata.get("lines_removed", 0)
-
-    # Increment the specific commit type based on LLM analysis
+    if repo_name not in profile_data["repositories"]: profile_data["repositories"][repo_name] = {"first_commit_ts": commit_ts, "last_commit_ts": commit_ts, "commit_count": 0, "lines_added": 0, "lines_removed": 0, "languages": {}, "technologies": {}, "inferred_commit_types": defaultdict(int)}
+    repo_entry = profile_data["repositories"][repo_name]; repo_entry.setdefault("languages", {}); repo_entry.setdefault("technologies", {})
+    if not isinstance(repo_entry.get("inferred_commit_types"), defaultdict): repo_entry["inferred_commit_types"] = defaultdict(int, repo_entry.get("inferred_commit_types", {}))
+    repo_entry["commit_count"] += 1; repo_entry["last_commit_ts"] = max(repo_entry.get("last_commit_ts") or float('-inf'), commit_ts); repo_entry["first_commit_ts"] = min(repo_entry.get("first_commit_ts") or float('inf'), commit_ts)
+    repo_entry["lines_added"] = repo_entry.get("lines_added", 0) + patch_metadata.get("lines_added", 0); repo_entry["lines_removed"] = repo_entry.get("lines_removed", 0) + patch_metadata.get("lines_removed", 0)
     repo_entry["inferred_commit_types"][intent] += 1
-
-    # Update languages/technologies *within this repo* based on LLM analysis
-    # We need to differentiate languages from other techs if desired structure requires it
-    # For simplicity, let's put all identified items in both lists for now,
-    # refinement could involve the LLM classifying them or using EXTENSION_LANG_MAP here.
-    current_repo_langs = set(technologies) # Assume LLM identifies languages within tech list
-    current_repo_techs = set(technologies)
-
+    current_repo_langs = set(technologies); current_repo_techs = set(technologies) # Simple approach: treat all identified as both lang/tech for repo stats
     for lang in current_repo_langs:
         if lang not in repo_entry["languages"]: repo_entry["languages"][lang] = {"commits": 0, "first_seen_ts": float('inf'), "last_seen_ts": float('-inf')}
-        lang_entry = repo_entry["languages"][lang]; lang_entry["commits"] += 1
-        lang_entry["first_seen_ts"] = min(lang_entry.get("first_seen_ts") or float('inf'), commit_ts)
-        lang_entry["last_seen_ts"] = max(lang_entry.get("last_seen_ts") or float('-inf'), commit_ts)
-
+        lang_entry = repo_entry["languages"][lang]; lang_entry["commits"] += 1; lang_entry["first_seen_ts"] = min(lang_entry.get("first_seen_ts") or float('inf'), commit_ts); lang_entry["last_seen_ts"] = max(lang_entry.get("last_seen_ts") or float('-inf'), commit_ts)
     for tech in current_repo_techs:
         if tech not in repo_entry["technologies"]: repo_entry["technologies"][tech] = {"commits": 0, "first_seen_ts": float('inf'), "last_seen_ts": float('-inf')}
-        tech_entry = repo_entry["technologies"][tech]; tech_entry["commits"] += 1
-        tech_entry["first_seen_ts"] = min(tech_entry.get("first_seen_ts") or float('inf'), commit_ts)
-        tech_entry["last_seen_ts"] = max(tech_entry.get("last_seen_ts") or float('-inf'), commit_ts)
-
+        tech_entry = repo_entry["technologies"][tech]; tech_entry["commits"] += 1; tech_entry["first_seen_ts"] = min(tech_entry.get("first_seen_ts") or float('inf'), commit_ts); tech_entry["last_seen_ts"] = max(tech_entry.get("last_seen_ts") or float('-inf'), commit_ts)
 
     # 2. Update Technology Experience Section (Global)
     profile_data.setdefault("technology_experience", {})
-    for tech in technologies: # Iterate through all techs identified by LLM
-        if not isinstance(tech, str) or not tech: continue # Basic validation
-
-        # Initialize tech entry if it doesn't exist
-        if tech not in profile_data["technology_experience"]:
-            profile_data["technology_experience"][tech] = {"first_seen_ts": float('inf'), "last_seen_ts": float('-inf'), "total_commits": 0, "repos": set()}
+    for tech in technologies:
+        if not isinstance(tech, str) or not tech: continue
+        if tech not in profile_data["technology_experience"]: profile_data["technology_experience"][tech] = {"first_seen_ts": float('inf'), "last_seen_ts": float('-inf'), "total_commits": 0, "repos": set()}
         tech_entry = profile_data["technology_experience"][tech]
-        # Ensure 'repos' is a set for internal processing
-        if not isinstance(tech_entry.get("repos"), set):
-             tech_entry["repos"] = set(tech_entry.get("repos", []))
-
-        # Increment global commit count for this tech
-        tech_entry["total_commits"] = tech_entry.get("total_commits", 0) + 1
-        # Add the current repo to the list for this tech
-        tech_entry["repos"].add(repo_name)
-        # Update first/last seen timestamps globally for this tech
-        tech_entry["last_seen_ts"] = max(tech_entry.get("last_seen_ts") or float('-inf'), commit_ts)
-        tech_entry["first_seen_ts"] = min(tech_entry.get("first_seen_ts") or float('inf'), commit_ts)
+        if not isinstance(tech_entry.get("repos"), set): tech_entry["repos"] = set(tech_entry.get("repos", []))
+        tech_entry["total_commits"] = tech_entry.get("total_commits", 0) + 1; tech_entry["repos"].add(repo_name); tech_entry["last_seen_ts"] = max(tech_entry.get("last_seen_ts") or float('-inf'), commit_ts); tech_entry["first_seen_ts"] = min(tech_entry.get("first_seen_ts") or float('inf'), commit_ts)
 
     # 3. Add Potential Notables
     profile_data.setdefault("potential_notables", [])
     for notable_mention in notables:
-        if isinstance(notable_mention, str) and notable_mention: # Expecting strings now
-            # Construct the notable object
-            notable = {
-                "commit_hash": commit_hash,
-                "timestamp": commit_ts,
-                "repo": repo_name,
-                "mention": notable_mention
-            }
-            # Basic check to avoid exact duplicates (same hash, same mention text)
+        if isinstance(notable_mention, str) and notable_mention:
+            notable = {"commit_hash": commit_hash, "timestamp": commit_ts, "repo": repo_name, "mention": notable_mention}
             exists = any(n.get("commit_hash") == notable.get("commit_hash") and n.get("mention") == notable.get("mention") for n in profile_data["potential_notables"])
-            if not exists:
-                profile_data["potential_notables"].append(notable)
-        elif notable_mention: # Log if it's not a non-empty string
-             print(f"  Warning: Invalid 'notable' item received from LLM (expected string): {notable_mention}")
-
+            if not exists: profile_data["potential_notables"].append(notable)
+        elif notable_mention: print(f"  Warning: Invalid 'notable' item received from LLM (expected string): {notable_mention}")
     return profile_data
 
 
 # --- Main Processing Logic ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Incrementally process self-contained git patches using Ollama (analysis only) to build a consolidated developer profile.") # Updated description
+    parser = argparse.ArgumentParser(description="Incrementally process self-contained git patches using Ollama (analysis only) to build a consolidated developer profile.")
     parser.add_argument("patch_root_dir", help="Root directory containing the extracted patches.")
     parser.add_argument("author_subdirs", nargs='+', help="One or more author persona subdirectories.")
     parser.add_argument("profile_output_dir", help="Directory for the consolidated profile JSON.")
@@ -268,7 +199,7 @@ def main():
     profile_filename = f"profile_{person_identifier}.json"
     profile_path = profile_dir / profile_filename
 
-    print(f"--- Starting Consolidated LLM assisted Patch Processing ---")
+    print(f"--- Starting Consolidated Patch Processing (LLM Analysis Only, Randomized) ---") # Updated title
     print(f"Person Identifier: {person_identifier}")
     print(f"Processing Author Subdirs: {', '.join(args.author_subdirs)}")
     print(f"Patch Source Root: {patch_root_dir}")
@@ -278,61 +209,63 @@ def main():
 
     profile_data = load_profile(profile_path, person_identifier, args.author_subdirs)
 
-    # --- Collect all patches ---
-    patches_by_repo_simple_name = defaultdict(list)
+    # --- Collect ALL patches into a single list ---
+    all_patch_paths = []
     all_author_dirs = [patch_root_dir / subdir for subdir in args.author_subdirs]
     total_patches_found = 0
+
     print("Scanning for patch files...")
     for author_dir_path in all_author_dirs:
         if not author_dir_path.is_dir(): print(f"Warning: Author directory not found: {author_dir_path}. Skipping."); continue
-        for item in author_dir_path.iterdir():
-             if item.is_dir():
-                 repo_name_simple = item.name
-                 repo_patch_files = list(item.glob("*.patch"))
-                 if repo_patch_files: patches_by_repo_simple_name[repo_name_simple].extend(repo_patch_files); total_patches_found += len(repo_patch_files)
-    print(f"Found {total_patches_found} total patch files across {len(patches_by_repo_simple_name)} unique simple repository names.")
+        # Use rglob to find *.patch files recursively within each author directory
+        author_patches = list(author_dir_path.rglob("*.patch"))
+        all_patch_paths.extend(author_patches)
+        total_patches_found += len(author_patches)
+
+    print(f"Found {total_patches_found} total patch files across {len(args.author_subdirs)} author persona(s).")
+
+    # --- Shuffle the collected patches ---
+    random.shuffle(all_patch_paths)
+    print(f"Processing order randomized.")
 
     processed_in_run = 0; skipped_ingested = 0; error_skipped = 0; skipped_size = 0
     max_to_process = args.max_patches if args.max_patches >= 0 else float('inf')
 
-    # --- Process repo by repo ---
-    sorted_repo_simple_names = sorted(patches_by_repo_simple_name.keys())
-    for repo_name_simple in sorted_repo_simple_names:
+    # --- Process the shuffled flat list of patches ---
+    for patch_path in all_patch_paths:
         if processed_in_run >= max_to_process and args.max_patches >= 0: break
-        patch_files = patches_by_repo_simple_name[repo_name_simple]
-        print(f"\n--- Processing repository (simple name): {repo_name_simple} ({len(patch_files)} patches found) ---")
 
-        # --- Process patches for this repo ---
-        patch_files.sort()
-        for patch_path in patch_files:
-            if processed_in_run >= max_to_process and args.max_patches >= 0: break
+        ingested_marker_path = patch_path.with_suffix(".patch.ingested")
+        commit_hash = patch_path.stem
 
-            ingested_marker_path = patch_path.with_suffix(".patch.ingested")
-            commit_hash = patch_path.stem
+        # Check state using marker file OR hash list in profile
+        # Need to check against the potentially large list in profile_data
+        if ingested_marker_path.exists() or commit_hash in profile_data.get("processed_patch_hashes", []):
+            skipped_ingested += 1
+            continue
 
-            if ingested_marker_path.exists() or commit_hash in profile_data.get("processed_patch_hashes", []): skipped_ingested += 1; continue
+        # Determine the simple repo name from the patch path's parent directory
+        repo_name_for_profile = patch_path.parent.name
 
-            repo_name_for_profile = repo_name_simple
-            print(f"\nProcessing: {patch_path.relative_to(patch_root_dir)}")
+        # Display progress (less structured than repo-by-repo)
+        print(f"\nProcessing [{processed_in_run+1}/{int(max_to_process) if max_to_process != float('inf') else 'all new'}]: {patch_path.relative_to(patch_root_dir)}")
 
-            try:
-                # --- Size/Line Checks ---
-                file_size = patch_path.stat().st_size
-                if file_size > max_patch_size_bytes: print(f"  Warning: Patch file size ({file_size} bytes) exceeds limit. Skipping."); skipped_size += 1; continue
-                # Read content only after size check passes
-                with open(patch_path, 'r', encoding='utf-8', errors='ignore') as f: patch_content = f.read()
-                if not patch_content.strip(): print("  Warning: Patch file is empty. Skipping."); error_skipped += 1; continue
-                line_count = patch_content.count('\n') + 1
-                if line_count > max_patch_lines: print(f"  Warning: Patch file line count ({line_count}) exceeds limit. Skipping."); skipped_size += 1; continue
+        try:
+            # --- Size/Line Checks ---
+            file_size = patch_path.stat().st_size
+            if file_size > max_patch_size_bytes: print(f"  Warning: Patch file size ({file_size} bytes) exceeds limit. Skipping."); skipped_size += 1; continue
+            with open(patch_path, 'r', encoding='utf-8', errors='ignore') as f: patch_content = f.read()
+            if not patch_content.strip(): print("  Warning: Patch file is empty. Skipping."); error_skipped += 1; continue
+            line_count = patch_content.count('\n') + 1
+            if line_count > max_patch_lines: print(f"  Warning: Patch file line count ({line_count}) exceeds limit. Skipping."); skipped_size += 1; continue
 
-                # --- Extract Metadata (including timestamp) ---
-                patch_metadata = parse_patch_metadata_from_content(patch_content, commit_hash)
-                commit_timestamp = patch_metadata["timestamp"]
-                if commit_timestamp is None: print(f"  Critical Error: Failed to parse 'CommitTimestamp:' from {patch_path}. Skipping patch."); error_skipped += 1; continue
+            # --- Extract Metadata (including timestamp) ---
+            patch_metadata = parse_patch_metadata_from_content(patch_content, commit_hash)
+            commit_timestamp = patch_metadata["timestamp"]
+            if commit_timestamp is None: print(f"  Critical Error: Failed to parse 'CommitTimestamp:' from {patch_path}. Skipping patch."); error_skipped += 1; continue
 
-                # --- Prepare NEW Simplified Prompt ---
-                # No profile context is included!
-                prompt = f"""
+            # --- Prepare NEW Simplified Prompt (No profile context) ---
+            prompt = f"""
 You are an expert code contribution analyst. Your task is to analyze the provided Git commit patch (which includes a CommitTimestamp header, the commit message, a separator, and the code diff) and extract specific pieces of information.
 
 **Input Git Patch Content:**
@@ -370,49 +303,49 @@ Your response MUST be a valid JSON object containing ONLY the extracted informat
 - Ensure 'notables' is a list of strings directly extracted or summarized from the commit message. If no notables are found, provide an empty list `[]`.
 - Do not include explanations outside the JSON structure.
 """
-                # --- End New Prompt ---
+            # --- End New Prompt ---
 
-                # 4. Call Ollama API
-                llm_analysis_result = call_ollama(prompt, ollama_model, ollama_url)
-                time.sleep(0.5)
+            # 4. Call Ollama API
+            llm_analysis_result = call_ollama(prompt, ollama_model, ollama_url)
+            time.sleep(0.5) # Be nice to local API
 
-                # 5. Process LLM Response & Update FULL Profile Data using Python logic
-                if llm_analysis_result:
-                    # Pass the FULL profile_data dict and the LLM ANALYSIS results
-                    profile_data = update_profile_based_on_analysis(
-                        profile_data, llm_analysis_result, patch_metadata, repo_name_for_profile
-                    )
+            # 5. Process LLM Response & Update FULL Profile Data using Python logic
+            if llm_analysis_result:
+                # Pass the FULL profile_data dict and the LLM ANALYSIS results
+                profile_data = update_profile_based_on_analysis(
+                    profile_data, llm_analysis_result, patch_metadata, repo_name_for_profile
+                )
 
-                    # Add hash to processed list AFTER successful update
-                    if commit_hash not in profile_data.get("processed_patch_hashes", []):
-                        profile_data.setdefault("processed_patch_hashes", []).append(commit_hash)
+                # Add hash to processed list AFTER successful update
+                if commit_hash not in profile_data.get("processed_patch_hashes", []):
+                    profile_data.setdefault("processed_patch_hashes", []).append(commit_hash)
 
-                    # Update metadata timestamps/files in the FULL profile
-                    profile_data["profile_metadata"]["last_updated_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    profile_data["profile_metadata"]["last_processed_patch_file"] = str(patch_path.relative_to(patch_root_dir))
+                # Update metadata timestamps/files in the FULL profile
+                profile_data["profile_metadata"]["last_updated_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                profile_data["profile_metadata"]["last_processed_patch_file"] = str(patch_path.relative_to(patch_root_dir))
 
-                    # 6. Save Updated FULL Profile (Atomically)
-                    atomic_save_profile(profile_data, profile_path)
+                # 6. Save Updated FULL Profile (Atomically)
+                atomic_save_profile(profile_data, profile_path)
 
-                    # 7. Create Ingested Marker File
-                    ingested_marker_path.touch()
-                    processed_in_run += 1
-                    print(f"  Successfully processed. Profile updated.")
-                else:
-                    print(f"  Error: Failed to get valid analysis response from Ollama for {patch_path}. Skipping.")
-                    error_skipped += 1
-
-            except KeyboardInterrupt:
-                 print("\nProcessing interrupted by user. Saving current state.")
-                 atomic_save_profile(profile_data, profile_path)
-                 sys.exit(1)
-            except Exception as e:
-                print(f"  Error processing patch {patch_path}: {e}")
-                import traceback
-                traceback.print_exc()
+                # 7. Create Ingested Marker File
+                ingested_marker_path.touch()
+                processed_in_run += 1
+                # print(f"  Successfully processed. Profile updated.") # Less verbose in flat list
+            else:
+                print(f"  Error: Failed to get valid analysis response from Ollama for {patch_path}. Skipping.")
                 error_skipped += 1
-        # End loop for patches within a repo
-        if processed_in_run >= max_to_process and args.max_patches >= 0: break # Break outer loop too
+
+        except KeyboardInterrupt:
+             print("\nProcessing interrupted by user. Saving current state.")
+             atomic_save_profile(profile_data, profile_path) # Save progress
+             sys.exit(1) # Indicate interruption
+        except Exception as e:
+            print(f"  Error processing patch {patch_path}: {e}")
+            import traceback
+            traceback.print_exc() # Print full traceback for debugging
+            error_skipped += 1
+            # Continue processing next patch on error
+    # End loop for shuffled patches
 
     # --- End of loops ---
     print("\n--- Processing Run Summary ---")
