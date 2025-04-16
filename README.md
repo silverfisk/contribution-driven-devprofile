@@ -167,6 +167,7 @@ Feel free to open issues or submit pull requests. Potential areas for improvemen
 * More sophisticated LLM prompting.
 * Generating different output formats (e.g., Markdown summaries).
 * Adding a separate step to analyze the final JSON profile for higher-level insights (e.g., generating a visual timeline).
+* Add analysis of other data sources, such as Jira, GitLab and GitHub issue ingesion, chat platforms, etc.
 * Improving error handling and reporting.
 
 ## License
