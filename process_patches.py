@@ -13,7 +13,7 @@ import sys
 
 # --- Configuration ---
 DEFAULT_OLLAMA_API_URL = "http://localhost:11434/api/generate"
-DEFAULT_OLLAMA_MODEL = "mistral"
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:14b"
 PROFILE_SCHEMA_VERSION = "1.6" # Incremented version for randomized processing
 PATCH_SEPARATOR = "-------------------- COMMIT MESSAGE ABOVE / PATCH BELOW --------------------"
 META_FILENAME = ".source_repo_info" # No longer read by script, but kept for info
