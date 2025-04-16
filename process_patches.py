@@ -14,20 +14,15 @@ import sys
 # --- Configuration ---
 DEFAULT_OLLAMA_API_URL = "http://localhost:11434/api/generate"
 DEFAULT_OLLAMA_MODEL = "mistral"
-PROFILE_SCHEMA_VERSION = "1.2" # Incremented version for self-contained patches
+PROFILE_SCHEMA_VERSION = "1.3" # Incremented version for pruned context
 PATCH_SEPARATOR = "-------------------- COMMIT MESSAGE ABOVE / PATCH BELOW --------------------"
-# Metadata filename (still read for repo context if needed, but not for source path)
 META_FILENAME = ".source_repo_info"
 # --- Sanity Check Limits ---
-# Skip patches larger than this size in bytes (e.g., 2MB)
 MAX_PATCH_SIZE_BYTES = 2 * 1024 * 1024
-# Skip patches with more lines than this (e.g., 100,000 lines)
 MAX_PATCH_LINES = 100000
 
 
-# --- Helper Functions (call_ollama, parse_patch_metadata_from_content, load_profile, atomic_save_profile, make_json_serializable, update_profile_data) ---
-# Note: These helper functions remain unchanged from the previous version,
-#       they are included here for completeness of the script file.
+# --- Helper Functions ---
 
 def call_ollama(prompt, model, ollama_url):
     """Sends prompt to Ollama and returns the parsed JSON response."""
@@ -45,7 +40,6 @@ def call_ollama(prompt, model, ollama_url):
         print("  Ollama response received.")
         if 'response' in response_data:
             try:
-                # Attempt to load the JSON string within the 'response' field
                 llm_json_output = json.loads(response_data['response'])
                 return llm_json_output
             except json.JSONDecodeError as e:
@@ -53,7 +47,6 @@ def call_ollama(prompt, model, ollama_url):
                 print(f"  Raw response content: {response_data['response'][:500]}...")
                 return None
             except TypeError as e:
-                 # Handle cases where response_data['response'] might not be a string
                  print(f"  Error: Problem processing Ollama response content (TypeError): {e}")
                  print(f"  Raw response value type: {type(response_data.get('response'))}")
                  print(f"  Raw response value: {response_data.get('response')}")
@@ -68,23 +61,19 @@ def call_ollama(prompt, model, ollama_url):
         print(f"  Error calling Ollama API at {ollama_url}: {e}")
         return None
     except Exception as e:
-        # Catch-all for other unexpected errors during the API call or response handling
         print(f"  An unexpected error occurred during Ollama call: {e}")
         return None
 
 def parse_patch_metadata_from_content(patch_content, commit_hash):
     """
     Extracts metadata directly from the patch file content,
-    including the embedded timestamp.
-    Returns None for timestamp if parsing fails.
+    including the embedded timestamp. Returns None for timestamp if parsing fails.
     """
     metadata = {
-        "commit_hash": commit_hash,
-        "timestamp": None, # Initialize as None
+        "commit_hash": commit_hash, "timestamp": None,
         "lines_added": len(re.findall(r"^\+[^+]", patch_content, re.MULTILINE)),
         "lines_removed": len(re.findall(r"^-[^-]", patch_content, re.MULTILINE)),
-        "commit_message": None,
-        "diff_content": None
+        "commit_message": None, "diff_content": None
     }
     ts_match = re.search(r"^CommitTimestamp:(\d+)", patch_content, re.MULTILINE)
     if ts_match:
@@ -100,6 +89,7 @@ def parse_patch_metadata_from_content(patch_content, commit_hash):
 
 def load_profile(profile_path, person_identifier, author_subdirs):
     """Loads profile or initializes a new one."""
+    # This function remains the same as v5
     if profile_path.exists():
         print(f"Loading existing profile for '{person_identifier}' from: {profile_path}")
         try:
@@ -109,7 +99,7 @@ def load_profile(profile_path, person_identifier, author_subdirs):
                 profile_data["profile_metadata"]["associated_author_subdirs"] = sorted(list(set(profile_data["profile_metadata"].get("associated_author_subdirs", []) + author_subdirs)))
                 profile_data["profile_metadata"].setdefault("person_identifier", person_identifier)
                 profile_data["profile_metadata"].setdefault("profile_schema_version", "unknown")
-                if profile_data["profile_metadata"]["profile_schema_version"] != PROFILE_SCHEMA_VERSION: print(f"Warning: Profile schema version mismatch.")
+                if profile_data["profile_metadata"]["profile_schema_version"] != PROFILE_SCHEMA_VERSION: print(f"Warning: Profile schema version mismatch (expected {PROFILE_SCHEMA_VERSION}, found {profile_data['profile_metadata']['profile_schema_version']}).")
                 for key in ["processed_patch_hashes", "repositories", "technology_experience", "contribution_timeline", "potential_notables"]: profile_data.setdefault(key, [] if key in ["processed_patch_hashes", "contribution_timeline", "potential_notables"] else {})
                 return profile_data
         except json.JSONDecodeError: print(f"Error: Corrupted profile file {profile_path}. A new profile will be created.")
@@ -122,9 +112,10 @@ def load_profile(profile_path, person_identifier, author_subdirs):
 
 def atomic_save_profile(profile_data, profile_path):
     """Saves profile JSON atomically."""
+    # This function remains the same as v5
     temp_path = profile_path.with_suffix(".json.tmp")
     try:
-        clean_profile_data = make_json_serializable(profile_data)
+        clean_profile_data = make_json_serializable(profile_data) # Use the general serializer for saving full data
         with open(temp_path, 'w', encoding='utf-8') as f: json.dump(clean_profile_data, f, indent=2, ensure_ascii=False)
         os.replace(temp_path, profile_path)
     except Exception as e:
@@ -134,15 +125,49 @@ def atomic_save_profile(profile_data, profile_path):
             except OSError as rm_e: print(f"Error removing temporary file {temp_path}: {rm_e}")
 
 def make_json_serializable(item):
-    """Recursively converts sets to sorted lists and handles infinity/None for timestamps."""
+    """Recursively converts sets to sorted lists and handles infinity/None for timestamps. Used for saving."""
+    # This function remains the same as v5
     if isinstance(item, set): return sorted(list(item))
     if isinstance(item, dict): return {k: make_json_serializable(v) for k, v in item.items()}
     if isinstance(item, list): return [make_json_serializable(elem) for elem in item]
     if item == float('inf') or item == float('-inf'): return None
     return item
 
+# --- NEW Helper Function for LLM Context Pruning ---
+def make_json_serializable_for_llm(item, key_path=""):
+    """
+    Recursively converts sets to lists, handles infinity/None,
+    AND specifically skips the 'repos' key when nested under 'technology_experience'.
+    Used only for creating the LLM prompt context string.
+    """
+    if isinstance(item, set):
+        # Sets should ideally not be in the pruned context, but handle just in case
+        return sorted(list(item))
+    if isinstance(item, dict):
+        new_dict = {}
+        for k, v in item.items():
+            # Construct the path to check if we are inside technology_experience.*.repos
+            current_key_path = f"{key_path}.{k}" if key_path else k
+            # Skip the 'repos' key specifically under 'technology_experience.*'
+            # Check if the path starts with 'technology_experience.' and ends with '.repos'
+            # This handles cases like technology_experience["Python"]["repos"]
+            if key_path.startswith("technology_experience.") and k == "repos":
+                # print(f"DEBUG: Skipping key: {current_key_path}") # Optional debug print
+                continue
+            new_dict[k] = make_json_serializable_for_llm(v, current_key_path)
+        return new_dict
+    if isinstance(item, list):
+        # Pass the current key_path down to list elements if needed for nested checks
+        return [make_json_serializable_for_llm(elem, key_path) for elem in item]
+    if item == float('inf') or item == float('-inf'):
+        return None
+    return item
+# --- END NEW Helper Function ---
+
+
 def update_profile_data(profile_data, llm_updates, patch_metadata, repo_name, commit_timestamp):
     """Applies LLM updates to the profile data. Requires commit_timestamp."""
+    # This function remains the same as v5
     if not llm_updates or not isinstance(llm_updates, dict) or "updates" not in llm_updates: print("  Warning: LLM provided no valid updates structure. Profile not changed."); return profile_data
     updates = llm_updates["updates"];
     if not isinstance(updates, dict): print("  Warning: LLM 'updates' field is not a dictionary. Profile not changed."); return profile_data
@@ -176,9 +201,11 @@ def update_profile_data(profile_data, llm_updates, patch_metadata, repo_name, co
             if not isinstance(tech_update, dict): continue
             if tech not in profile_data["technology_experience"]: profile_data["technology_experience"][tech] = {"first_seen_ts": float('inf'), "last_seen_ts": float('-inf'), "total_commits": 0, "repos": set()}
             tech_entry = profile_data["technology_experience"][tech]
+            # Ensure 'repos' is a set for internal processing
             if not isinstance(tech_entry.get("repos"), set): tech_entry["repos"] = set(tech_entry.get("repos", []))
             if tech_update.get("increment_commit_count"): tech_entry["total_commits"] = tech_entry.get("total_commits", 0) + 1
-            tech_entry["repos"].add(repo_name); tech_entry["last_seen_ts"] = max(tech_entry.get("last_seen_ts") or float('-inf'), commit_ts); tech_entry["first_seen_ts"] = min(tech_entry.get("first_seen_ts") or float('inf'), commit_ts)
+            tech_entry["repos"].add(repo_name); # Add repo name to the set
+            tech_entry["last_seen_ts"] = max(tech_entry.get("last_seen_ts") or float('-inf'), commit_ts); tech_entry["first_seen_ts"] = min(tech_entry.get("first_seen_ts") or float('inf'), commit_ts)
 
     # 3. Add Potential Notables
     notables_updates = updates.get("potential_notables")
@@ -190,6 +217,7 @@ def update_profile_data(profile_data, llm_updates, patch_metadata, repo_name, co
                 if not exists: notable.setdefault("timestamp", commit_ts); notable.setdefault("repo", repo_name); profile_data["potential_notables"].append(notable)
             else: print(f"  Warning: Invalid 'notable' item received from LLM: {notable}")
     return profile_data
+
 
 # --- Main Processing Logic ---
 
@@ -204,7 +232,6 @@ def main():
     parser.add_argument("--max_patches", type=int, default=-1, help="Maximum number of new patches to process in this run (-1 for all).")
     parser.add_argument("--max_patch_size", type=int, default=MAX_PATCH_SIZE_BYTES, help=f"Maximum patch size in bytes to process (default: {MAX_PATCH_SIZE_BYTES})")
     parser.add_argument("--max_patch_lines", type=int, default=MAX_PATCH_LINES, help=f"Maximum patch lines to process (default: {MAX_PATCH_LINES})")
-    # REMOVED: --original_repo_root argument
 
     args = parser.parse_args()
 
@@ -220,7 +247,7 @@ def main():
     profile_filename = f"profile_{person_identifier}.json"
     profile_path = profile_dir / profile_filename
 
-    print(f"--- Starting Consolidated Patch Processing (Self-Contained Patches) ---")
+    print(f"--- Starting Consolidated Patch Processing (Self-Contained Patches, Pruned Context) ---") # Updated title
     print(f"Person Identifier: {person_identifier}")
     print(f"Processing Author Subdirs: {', '.join(args.author_subdirs)}")
     print(f"Patch Source Root: {patch_root_dir}")
@@ -291,28 +318,37 @@ def main():
 
                 if commit_timestamp is None: print(f"  Critical Error: Failed to parse 'CommitTimestamp:' from {patch_path}. Skipping patch."); error_skipped += 1; continue
 
-                # --- MODIFICATION START: Prune context for LLM ---
+                # --- PRUNING LOGIC START ---
                 # Create a pruned version of the profile containing only data essential for LLM analysis
+                # Get the specific repo data, or an empty dict if it's the first commit for this repo
+                current_repo_context = profile_data.get("repositories", {}).get(repo_name_for_profile, {})
+                # Get the full tech experience data (we'll prune the 'repos' list during serialization)
+                tech_experience_context = profile_data.get("technology_experience", {})
+
                 profile_context_for_llm = {
-                    # Include repository data (can be large but is relevant context)
-                    "repositories": profile_data.get("repositories", {}),
-                    # Include technology experience (also relevant context)
-                    "technology_experience": profile_data.get("technology_experience", {})
+                    "repositories": {
+                        # Only include the current repo's context
+                        repo_name_for_profile: current_repo_context
+                    },
+                    "technology_experience": tech_experience_context
                     # Excluded: profile_metadata, processed_patch_hashes, contribution_timeline, potential_notables
                 }
-                # Convert this pruned context (which might contain sets internally) to JSON serializable format
-                serializable_profile_for_prompt = make_json_serializable(profile_context_for_llm)
+                # Convert to JSON serializable format, specifically excluding the 'repos' list within tech_experience
+                # Use the new helper function here
+                serializable_profile_for_prompt = make_json_serializable_for_llm(profile_context_for_llm)
                 current_profile_json_str = json.dumps(serializable_profile_for_prompt, indent=2)
-                # --- MODIFICATION END ---
+                # --- PRUNING LOGIC END ---
 
 
                 # --- THE PROMPT (Uses the pruned current_profile_json_str) ---
+                # The prompt text itself doesn't need to change, as it describes the conceptual structure.
+                # The actual JSON provided within it (`current_profile_json_str`) is now smaller.
                 prompt = f"""
 You are an expert code contribution analyst acting as a component in an automated pipeline.
 Your task is to analyze the provided Git commit patch (message + diff) and output a JSON object describing ONLY the updates needed for a developer's profile document.
 
 **Input Context:**
-1.  **Current Relevant Developer Profile Data (JSON):** (This reflects the relevant state BEFORE processing the current patch. NOTE: It may not be the complete profile.)
+1.  **Current Relevant Developer Profile Data (JSON):** (This reflects the relevant state BEFORE processing the current patch. NOTE: It contains only repositories and technology_experience sections, and the 'repos' list within technology_experience is omitted.)
     ```json
     {current_profile_json_str}
     ```
@@ -330,7 +366,7 @@ Your task is to analyze the provided Git commit patch (message + diff) and outpu
 
 **Your Task:**
 
-Analyze the patch content (commit message AND code diff) to extract information and determine updates for the profile JSON based *only* on this single patch. Use the provided profile data for context on existing experience.
+Analyze the patch content (commit message AND code diff) to extract information and determine updates for the profile JSON based *only* on this single patch. Use the provided profile data for context on existing experience for the specific repository and relevant technologies.
 
 **Analysis Steps:**
 1.  **Commit Intent:** Analyze the commit message (part after 'CommitTimestamp:' line and before '{PATCH_SEPARATOR}'). Determine the primary intent and classify it as ONE of: 'feature', 'fix', 'refactor', 'test', 'docs', 'chore', 'perf', 'other'.
@@ -392,15 +428,14 @@ Your response MUST be a valid JSON object containing ONLY the updates to apply t
 
                 # 5. Process LLM Response & Update FULL Profile Data
                 if llm_response:
-                    # Pass the FULL profile_data dict (which might contain sets) for update
+                    # Pass the FULL profile_data dict for update
                     profile_data = update_profile_data(profile_data, llm_response, patch_metadata, repo_name_for_profile, commit_timestamp)
                     # Add hash to processed list AFTER successful update
                     if commit_hash not in profile_data.get("processed_patch_hashes", []):
                         profile_data.setdefault("processed_patch_hashes", []).append(commit_hash)
-
                     # Update metadata timestamps/files in the FULL profile
                     profile_data["profile_metadata"]["last_updated_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                    profile_data["profile_metadata"]["last_processed_patch_file"] = str(patch_path.relative_to(patch_root_dir)) # Store relative path
+                    profile_data["profile_metadata"]["last_processed_patch_file"] = str(patch_path.relative_to(patch_root_dir))
 
                     # 6. Save Updated FULL Profile (Atomically)
                     atomic_save_profile(profile_data, profile_path)
